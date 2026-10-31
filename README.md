@@ -1,174 +1,154 @@
-# Language-Invariant Speech Depression Detection via Forward-Backward Siamese Feature Invariance
+# Speech Depression Detection via Siamese Forward-Backward Spectrogram Feature Invariance
 
-> **B.Tech Final-Year Project & Research Paper Candidate**  
-> *Enforcing True Acoustic Invariance, Resolving Gender Pitch Bias, and Eliminating Overfitting on DAIC-WOZ*
-
----
-
-## 📌 1. Executive Summary & The Research Gap
-
-Automated detection of Major Depressive Disorder (MDD) from speech is often hindered by **linguistic dependency**, **data scarcity**, and **gender pitch bias**. Previous state-of-the-art approaches—such as *Kim et al. (ICASSP 2026)*—attempt to make models language-independent using **passive audio augmentation** (e.g., appending reversed audio clips to the training set) or prompt-driven reprogramming on large acoustic transformers (AST, Whisper).
-
-### 🔍 The Core Gap Identified in Literature
-1. **Flaw of Passive Augmentation:** Simply feeding reversed audio as standard training samples **does not mathematically force feature invariance**. Deep neural networks still learn to memorize forward English phonetic sequences while treating reversed clips as separate noisy data.
-2. **Gender Pitch Bias & Frequency Shortcuts:** Standard 2D Convolutional Networks (like ResNet18) easily lock onto absolute fundamental frequencies ($F_0$). Male voices ($85{-}180\text{ Hz}$) and female voices ($165{-}255\text{ Hz}$) occupy completely different vertical Mel-spectrogram bins. Models often over-adapt to female formants, causing male test accuracy to collapse to near-random chance ($\sim 47{-}50\%$).
-3. **Feature Vector Scale Collapse (The MSE Illusion):** Minimizing Mean Squared Error ($\\text{MSE}$) between forward and backward feature vectors allows optimizers to "cheat" by shrinking vector scales toward zero ($\\|z\\| \\to 0$) rather than aligning feature directions.
-
-### 💡 Our Proposed Solution
-We implement an **explicit Forward-Backward Siamese Feature Invariance Constraint**:
-- **Explicit Cosine Invariance Loss ($\\lambda = 1.5$):** Forces the directional Cosine Similarity between forward speech $z_{\\text{fwd}}$ and time-reversed speech $z_{\\text{bwd}}$ to approach $1.0$ ($\\cos \\theta \\to 1.0$).
-- **Random Pitch-Shifting Augmentation ($\\pm 2$ semitones):** Destroys absolute $F_0$ pitch shortcuts, forcing early convolutional filters to learn pitch-invariant acoustic dynamics.
-- **Layer-4 Fine-Tuned ResNet18 Architecture:** Freezes Conv1 through Layer 3 to retain low-level acoustic edge filters while fine-tuning Layer 4 with differential learning rates ($1\\times 10^{-5}$ backbone, $1\\times 10^{-3}$ head).
+Automated depression detection using a regularized ResNet-18 feature extractor on 3.0-second participant audio segments from the DAIC-WOZ dataset. The pipeline enforces acoustic feature symmetry across forward and time-flipped Mel-spectrograms using a directional Cosine Invariance Loss.
 
 ---
 
-## 🏗️ 2. System Architecture & Methodology
+## 📌 1. Methodology & Pipeline Overview
 
-```
-                       ┌───────────────────────────────┐
-                       │   3.0s Audio Spectrogram (x)  │
-                       └───────────────┬───────────────┘
-                                       │
-                      ┌────────────────┴────────────────┐
-                      ▼                                 ▼
-             [ Forward Pass: x ]              [ Time-Reversed: x_bwd ]
-                      │                                 │
-                      ▼                                 ▼
-         ┌────────────────────────┐        ┌────────────────────────┐
-         │ LanguageInvariantResNet│        │ LanguageInvariantResNet│
-         │  (Layer 4 Fine-Tuned)  │        │  (Shared Weights)      │
-         └────────────┬───────────┘        └────────────┬───────────┘
-                      │                                 │
-                      ▼                                 ▼
-             Embedding: z_fwd                  Embedding: z_bwd
-                      │                                 │
-                      ├─────────────────────────────────┘
-                      │   Cosine Invariance Loss:
-                      │   L_inv = 1 - CosSim(z_fwd, z_bwd)
-                      ▼
-             [ Linear Classifier ]
-                      │
-                      ▼
-            Output: Normal / Depressed
-```
+The framework processes 3-second speech slices to classify speech as **Normal (PHQ-8 < 10)** or **Depressed (PHQ-8 ≥ 10)**.
 
-### 1. Data Pipeline & Preprocessing (`dataset.py`)
-- **Dataset:** DAIC-WOZ (Distress Analysis Interview Corpus - Wizard of Oz).
-- **Segmentation:** Audio interviews are windowed into non-overlapping **3.0-second participant-only clips** using transcript timestamps (interviewer voice and silence removed).
-- **Spectrogram Transformation:** Log-Mel Spectrograms ($128$ Mel bins, $N_{\\text{fft}} = 1024$, hop length $= 512$).
-- **Augmentations (Training Only):**
-  - **ImageNet Feature Standardization:** $(\\mathbf{x} - \\mu) / \\sigma$ using standard ImageNet parameters ($\\mu=[0.485, 0.456, 0.406], \\sigma=[0.229, 0.224, 0.225]$).
-  - **SpecAugment:** Frequency masking ($F=20$) and Time masking ($T=30$).
-  - **Dynamic Pitch Shifting:** Randomly applied to $35\%$ of training samples ($\\pm 2$ semitones) via `torchaudio.transforms.PitchShift`.
+### Model Architecture (`train.py`)
+* **Backbone:** Torchvision `ResNet18` (initialized with default ImageNet weights).
+* **Layer Freezing:** `conv1`, `bn1`, `layer1`, `layer2`, and `layer3` parameters are completely frozen (`requires_grad = False`) to retain low-level acoustic edge representations.
+* **Trainable Parameters:** Only `layer4` and the final classification head (`fc`) are updated during training.
+* **Bottleneck Embeddings:** A 512-dimensional vector $z$ extracted via `base.avgpool` and flattened prior to the dropout (`p = 0.5`) and linear classifier.
 
-### 2. Loss Formulation (`train.py`)
-The model is trained end-to-end using a dual-objective loss function:
-
-$$\\mathcal{L}_{\\text{total}} = \\mathcal{L}_{\\text{CE}}(y, \\hat{y}) + \\lambda \\cdot \\mathcal{L}_{\\text{inv}}$$
-
-Where:
-- $\\mathcal{L}_{\\text{CE}}$ is **Weighted Cross-Entropy Loss** with class weights $[1.0, 2.2]$ to counteract class imbalance (77% Normal / 23% Depressed).
-- $\\mathcal{L}_{\\text{inv}} = 1 - \\text{CosineSimilarity}(z_{\\text{fwd}}, z_{\\text{bwd}})$ penalizes directional divergence in the $512$-dimensional bottleneck embedding space.
-- $\\lambda = 1.5$ heavily enforces linguistic symmetry.
+### Forward-Backward Siamese Invariance Formulation
+Rather than training on passive audio augmentation, the training loop passes forward and time-reversed spectrogram representations in parallel:
+1. **Forward Spec ($x_{\text{fwd}}$):** The original normalized 3-channel Mel-spectrogram.
+2. **Backward Spec ($x_{\text{bwd}}$):** The Mel-spectrogram horizontally flipped along the temporal axis via `torch.flip(images, dims=[-1])`.
+3. **Embeddings:** $z_{\text{fwd}} = f_{\theta}(x_{\text{fwd}})$ and $z_{\text{bwd}} = f_{\theta}(x_{\text{bwd}})$.
+4. **Classification Loss:** Computed exclusively on forward features:
+   $$\mathcal{L}_{\text{cls}} = \text{CrossEntropyLoss}(\hat{y}_{\text{fwd}}, y; w=[1.0, 2.2])$$
+5. **Invariance Loss:** Measures directional divergence in bottleneck space:
+   $$\mathcal{L}_{\text{inv}} = 1 - \frac{1}{B}\sum_{i=1}^{B} \text{CosineSimilarity}(z_{\text{fwd}}^{(i)}, z_{\text{bwd}}^{(i)})$$
+6. **Total Loss:**
+   $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{cls}} + \lambda \cdot \mathcal{L}_{\text{inv}} \quad (\lambda = 1.5)$$
 
 ---
 
-## 📊 3. Experimental Results & Improvements
+## 🎛️ 2. Acoustic Processing & Data Augmentation (`dataset.py`)
 
-### Segment-Level Performance (952 Test Clips)
-
-| Metric | Baseline (Unregularized) | Final Proposed Pipeline | Net Improvement |
-| :--- | :---: | :---: | :---: |
-| **Segment Accuracy** | 62.00% | **65.86% (~66%)** | **+3.86%** |
-| **Segment Macro F1** | 0.59 | **0.62** | **+0.03** |
-| **Depressed Class F1** | 0.48 | **0.51** | **+0.03** |
-| **Male Test Accuracy** | 47.58% | **53.76%** | **+6.18%** |
-| **Female Test Accuracy** | 71.38% | **73.62%** | **+2.24%** |
-| **Invariance Distance ($1 - \\cos \\theta$)** | ~0.624 (MSE trick) | **0.1744 (82.56% similarity)** | **Massive Alignment** |
-
-### Confusion Matrix Breakdown (Final Run)
-
-```
-                       Predicted Normal    Predicted Depressed
-Actual Normal               460                  216
-Actual Depressed            109                  167
-```
-- **True Negatives ($TN$):** 460 clips correctly identified as Normal.
-- **True Positives ($TP$):** 167 clips correctly identified as Depressed (60.5% segment recall).
+* **Input Specifications:** Mono WAV audio sampled at $16\text{ kHz}$. Audio clips are padded or clipped to exactly 48,000 samples (3.0 seconds).
+* **Spectrogram Generation:**
+  * Mel Bins: 128
+  * FFT Size ($N_{\text{fft}}$): 1024
+  * Hop Length: 512
+  * Decibel Conversion: `torchaudio.transforms.AmplitudeToDB()`
+  * Min-Max Normalization: $(x - x_{\min}) / (x_{\max} - x_{\min} + 10^{-6})$
+  * Channel Expansion: 1 channel repeated across 3 channels (`spec.repeat(3, 1, 1)`).
+  * Standardization: Normalized using standard ImageNet RGB statistics ($\mu = [0.485, 0.456, 0.406]$, $\sigma = [0.229, 0.224, 0.225]$).
+* **Training Augmentations:**
+  * **Pitch Shifting:** Applied with a 35% probability (`p < 0.35`) via `torchaudio.transforms.PitchShift(sample_rate=16000, n_steps=2)` (shifts pitch upward by $+2$ semitones).
+  * **SpecAugment:** `FrequencyMasking(freq_mask_param=20)` and `TimeMasking(time_mask_param=30)`.
 
 ---
 
-## 🔬 4. Clinical Explainability & Visual Dashboards
+## 📂 3. Repository File Structure
 
-Running `python3 explain.py` generates a dual clinical explanation dashboard (`output/gradcam_sample.png`):
+```
+.
+├── extract_daic.py         # Utility to scan ~/Downloads and unpack DAIC session WAVs/transcripts
+├── preprocess_daic.py      # Slices participant speech into 3s chunks; creates metadata.csv
+├── dataset.py              # PyTorch Dataset, transforms, and DataLoader definitions
+├── train.py                # Siamese ResNet-18 training with Cosine Invariance Loss
+├── evaluate.py             # Computes segment & patient metrics; generates confusion matrix
+├── explain.py              # Grad-CAM on Layer 4 and vocal energy profile for Patient 343
+├── SAD_AI Registration.pdf # DTU Youth Innovation Challenge registration document
+├── data/                   # (Unreferenced) TESS dataset audio clips (OAF_*_sad.wav, etc.)
+└── output/                 # Artifact directory
+    ├── best_model.pth      # Saved checkpoint with highest validation Macro-F1
+    ├── loss_curve.png      # Training & validation loss vs. epochs
+    ├── confusion_matrix.png# Confusion matrix heatmap on the test set
+    └── gradcam_sample.png  # Dual Grad-CAM + vocal energy contour visualization
+```
 
-1. **Grad-CAM Acoustic Focus (Left Panel):**
-   - Highlights feature importance in `Layer 4`.
-   - **Key Finding:** The heatmap isolates **Mel Frequency Bins 40–80 (2.5 kHz – 5.0 kHz)**, corresponding to upper vocal tract formants ($F_3, F_4$) and prosodic energy dynamics, rather than lower phonetic frequencies.
-2. **Clinical Biomarker Diagnostics (Right Panel):**
-   - Extracts the **Vocal Energy Contour** across 3.0-second time frames.
-   - **Depression Biomarker:** Depressed patients exhibit low vocal energy dynamism ($\\sigma = 0.0712$), visually demonstrating monotone speech patterns associated with psychomotor retardation.
+> **Note on Data Directories:** 
+> * `data_daic/` (the target folder for preprocessed DAIC-WOZ audio segments and `metadata.csv`) is **not included** in this repository due to DAIC-WOZ clinical data access restrictions.
+> * The `data/` directory in the repository contains ~800 files from the Toronto Emotional Speech Set (TESS) (`OAF_*_sad.wav`, `OAF_*_neutral.wav`). These files are **not utilized** by the existing codebase.
 
 ---
 
-## 📁 5. Project Structure
+## ⚙️ 4. Data Partitioning & Ground Truth Labels
 
-```
-depressionDetection/
-├── data_daic/              # Processed DAIC-WOZ dataset segments & metadata
-│   ├── metadata.csv
-│   └── segments/
-├── output/                 # Model checkpoints and visual plots
-│   ├── best_model.pth
-│   ├── loss_curve.png
-│   ├── confusion_matrix.png
-│   └── gradcam_sample.png
-├── preprocess_daic.py      # Audio slicing & speaker-centric timestamp extraction
-├── dataset.py              # PyTorch Dataset, SpecAugment, PitchShift & DataLoader
-├── train.py                # Siamese ResNet18 training with Cosine Invariance Loss
-├── evaluate.py             # Patient-level & subgroup evaluation script
-└── explain.py              # Grad-CAM & vocal energy contour dashboard generator
-```
+Preprocessed via `preprocess_daic.py`:
+* **Dataset:** DAIC-WOZ (Distress Analysis Interview Corpus - Wizard of Oz), participants 300 to 350.
+* **Speaker Isolation:** Parses participant timestamps from `{pid}_TRANSCRIPT.csv`, extracting participant intervals $\ge 0.5\text{ s}$ and dropping interviewer audio.
+* **Label Mapping:** Binary depression defined by official AVEC 2016 ground truth ($\text{PHQ-8} \ge 10 \implies 1$, $\text{PHQ-8} < 10 \implies 0$).
+* **Speaker-Independent Split:**
+  * **Test (7 Patients):**
+    * Depressed: 343 (M), 345 (M), 347 (M)
+    * Normal: 344 (F), 346 (F), 348 (M), 349 (F)
+  * **Validation (7 Patients):** `{335, 336, 337, 338, 339, 340, 341}`
+  * **Train (Remaining Patients):** All sessions between 300 and 334.
 
 ---
 
-## 🚀 6. Quickstart & Execution Guide
+## 🚀 5. Installation & Execution Guide
 
 ### Prerequisites
+Install dependencies in a Python 3.10+ environment:
 ```bash
 pip install torch torchaudio torchvision scikit-learn seaborn matplotlib pandas pytorch-grad-cam
 ```
 
-### Execution Pipeline
+### Step 1: Extract Raw DAIC Sessions
+If DAIC-WOZ session archives are located in your `~/Downloads` folder:
+```bash
+python extract_daic.py
+```
+This extracts audio (`*_AUDIO.wav`) and transcripts (`*_TRANSCRIPT.csv`) into `daic_raw/`.
 
-1. **Preprocess Audio Data:**
-   ```bash
-   python3 preprocess_daic.py
-   ```
-2. **Train Model (15 Epochs with Cosine Invariance Loss):**
-   ```bash
-   python3 train.py
-   ```
-3. **Evaluate Performance (Segment & Patient Level):**
-   ```bash
-   python3 evaluate.py
-   ```
-4. **Generate Clinical Explainability Report:**
-   ```bash
-   python3 explain.py
-   ```
+### Step 2: Preprocess Audio Segments
+Slice participant-only speech into 3-second segments and generate the metadata index:
+```bash
+python preprocess_daic.py
+```
+*Outputs: `data_daic/segments/*.wav` and `data_daic/metadata.csv`.*
+
+### Step 3: Train the Model
+Train for 15 epochs using AdamW (`backbone lr=1e-5`, `fc lr=1e-3`), Cosine Annealing, and $\lambda_{\text{inv}}=1.5$:
+```bash
+python train.py
+```
+*Outputs: `output/best_model.pth` and `output/loss_curve.png`.*
+
+### Step 4: Evaluate Performance
+Evaluate segment-level accuracy, patient-level majority voting, and subgroup gender accuracy on the test set:
+```bash
+python evaluate.py
+```
+*Outputs: Terminal summary table and `output/confusion_matrix.png`.*
+
+### Step 5: Generate Explainability Dashboard
+Compute Grad-CAM heatmaps on Layer 4 and display vocal energy contours:
+```bash
+python explain.py
+```
+*Outputs: `output/gradcam_sample.png`.*
 
 ---
 
-## 📜 Citation & Research Reference
+## 🔍 6. Evaluation Logic & Explainability
 
-If utilizing this codebase or architecture for research, please cite:
+### Patient-Level Aggregation (`evaluate.py`)
+For each test patient, segment prediction probabilities $\hat{p}$ are averaged across all 3-second interview slices:
+$$\hat{y}_{\text{patient}} = \begin{cases} 1 & \text{if } \frac{1}{N}\sum_{i=1}^{N} \hat{p}_i \ge 0.50 \\ 0 & \text{otherwise} \end{cases}$$
+
+### Clinical Explainability (`explain.py`)
+1. **Grad-CAM:** Hooks into `model.backbone[-2][-1]` (the terminal `BasicBlock` of ResNet-18 Layer 4) using `pytorch_grad_cam.GradCAM`.
+2. **Vocal Energy Contour:** Averages normalized Mel-spectrogram energy across frequency bins to produce a 1D temporal energy contour and calculates temporal standard deviation ($\sigma$) to measure vocal energy dynamism.
+
+---
+
+## 📜 7. Citation & Academic Reference
 
 ```bibtex
 @article{hasan2026depression,
-  title={Language-Invariant Speech Depression Detection via Forward-Backward Siamese Feature Invariance},
+  title={Speech Depression Detection via Siamese Forward-Backward Spectrogram Feature Invariance},
   author={Hasan et al.},
-  journal={B.Tech Capstone Project / IEEE Manuscript Candidate},
+  journal={B.Tech Capstone Project / Research Candidate},
   year={2026}
 }
 ```
