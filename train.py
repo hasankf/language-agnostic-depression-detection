@@ -1,90 +1,178 @@
 import os
-import sys
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision.models import resnet18, ResNet18_Weights
 from sklearn.metrics import f1_score
 import matplotlib.pyplot as plt
-from dataset import get_dataloaders
+from dataset import get_daic_dataloaders
 
-os.makedirs("output", exist_ok=True)
+# Architecture with feature extractor exposed for Siamese Invariance
+class LanguageInvariantResNet18(nn.Module):
+    def __init__(self, num_classes=2, dropout_rate=0.5):
+        super().__init__()
+        base = resnet18(weights=ResNet18_Weights.DEFAULT)
+        
+        # Freeze early layers to prevent overfitting to specific speaker timbres
+        # General low-level audio filters (edges, textures) stay intact
+        for param in [base.conv1, base.bn1, base.layer1, base.layer2, base.layer3]:
+            for p in param.parameters():
+                p.requires_grad = False
+                
+        self.backbone = nn.Sequential(
+            base.conv1,
+            base.bn1,
+            base.relu,
+            base.maxpool,
+            base.layer1,
+            base.layer2,
+            base.layer3,
+            base.layer4,  # Only layer4 is fine-tuned
+            base.avgpool
+        )
+        self.dropout = nn.Dropout(p=dropout_rate)
+        self.fc = nn.Linear(base.fc.in_features, num_classes)
+        
+    def forward_features(self, x):
+        feats = self.backbone(x)
+        feats = torch.flatten(feats, 1) # 512-dimensional embedding
+        return feats
+        
+    def forward(self, x):
+        feats = self.forward_features(x)
+        feats = self.dropout(feats)
+        return self.fc(feats)
 
-# Enable Mac GPU (mps), CUDA, or fallback to CPU
-if torch.backends.mps.is_available():
-    device = torch.device("mps")
-elif torch.cuda.is_available():
-    device = torch.device("cuda")
-else:
-    device = torch.device("cpu")
+def train_model():
+    os.makedirs("output", exist_ok=True)
 
-train_loader, val_loader, _, _ = get_dataloaders("data")
+    # Select hardware accelerator
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
 
-model = resnet18(weights=ResNet18_Weights.DEFAULT)
-model.fc = nn.Linear(model.fc.in_features, 2)
-model = model.to(device)
+    print(f"Using device: {device}")
 
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
+    # Data Loaders
+    train_loader, val_loader, _, _ = get_daic_dataloaders(batch_size=32)
 
-epochs = 12
-best_val_f1 = 0.0
-train_losses, val_losses = [], []
+    model = LanguageInvariantResNet18(num_classes=2, dropout_rate=0.5).to(device)
 
-print(f"Starting training on device: {device}\n")
-
-for epoch in range(epochs):
-    model.train()
-    running_loss = 0.0
+    # 1. Class weights & Loss
+    class_weights = torch.tensor([1.0, 2.2]).to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     
-    for i, (images, labels, _) in enumerate(train_loader):
-        images, labels = images.to(device), labels.to(device)
+    epochs = 25
+    lambda_invariance = 0.5
+
+    # 2. Extract trainable parameter lists
+    trainable_backbone = [p for p in model.backbone.parameters() if p.requires_grad]
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+
+    # 3. Differential Learning Rates
+    optimizer = torch.optim.AdamW([
+        {'params': trainable_backbone, 'lr': 1e-5, 'weight_decay': 1e-1},
+        {'params': model.fc.parameters(), 'lr': 1e-3, 'weight_decay': 1e-2}
+    ])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    # 4. Initialize tracking variables (Prevents NameError)
+    best_val_f1 = 0.0
+    train_losses, val_losses, inv_losses = [], [], []
+
+    print("=================================================================")
+    print("Training Regularized Language-Invariant ResNet18 (Layer4 Tuned)...")
+    print(f"Trainable Parameters: {sum(p.numel() for p in trainable_params):,}")
+    print(f"Batches: {len(train_loader)} | Epochs: {epochs} | Class Weights: [1.0, 2.2]")
+    print("=================================================================\n")
+
+    for epoch in range(epochs):
+        model.train()
+        running_total_loss = 0.0
+        running_inv_loss = 0.0
         
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-        
-        running_loss += loss.item() * images.size(0)
-        
-        # Print live batch counter
-        print(f"\rEpoch {epoch+1:02d}/{epochs} | Batch {i+1}/{len(train_loader)} processing...", end="", flush=True)
-        
-    epoch_train_loss = running_loss / len(train_loader.dataset)
-    train_losses.append(epoch_train_loss)
-    
-    # Validation Phase
-    model.eval()
-    val_loss = 0.0
-    all_preds, all_targets = [], []
-    with torch.no_grad():
-        for images, labels, _ in val_loader:
+        for i, (images, labels, _, _) in enumerate(train_loader):
             images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            val_loss += loss.item() * images.size(0)
             
-            preds = torch.argmax(outputs, dim=1)
-            all_preds.extend(preds.cpu().numpy())
-            all_targets.extend(labels.cpu().numpy())
+            spec_fwd = images
+            spec_bwd = torch.flip(images, dims=[-1])
             
-    epoch_val_loss = val_loss / len(val_loader.dataset)
-    val_losses.append(epoch_val_loss)
-    val_f1 = f1_score(all_targets, all_preds, average='macro')
-    
-    print(f"\rEpoch {epoch+1:02d}/{epochs} | Train Loss: {epoch_train_loss:.4f} | Val Loss: {epoch_val_loss:.4f} | Val F1: {val_f1:.4f}")
-    
-    if val_f1 > best_val_f1:
-        best_val_f1 = val_f1
-        torch.save(model.state_dict(), "output/best_model.pth")
-        print("  --> Best model checkpoint saved!")
+            optimizer.zero_grad()
+            
+            feat_fwd = model.forward_features(spec_fwd)
+            feat_bwd = model.forward_features(spec_bwd)
+            
+            out_fwd = model.fc(model.dropout(feat_fwd))
+            
+            loss_cls = criterion(out_fwd, labels)
+            loss_inv = F.mse_loss(feat_fwd, feat_bwd)
+            
+            total_loss = loss_cls + lambda_invariance * loss_inv
+            
+            total_loss.backward()
+            optimizer.step()
+            
+            running_total_loss += total_loss.item() * images.size(0)
+            running_inv_loss += loss_inv.item() * images.size(0)
+            
+            print(f"\rEpoch {epoch+1:02d}/{epochs} | Batch {i+1}/{len(train_loader)} | Cls Loss: {loss_cls.item():.4f} | Inv Loss: {loss_inv.item():.4f}", end="", flush=True)
+            
+        scheduler.step()
+        epoch_train_loss = running_total_loss / len(train_loader.dataset)
+        epoch_inv_loss = running_inv_loss / len(train_loader.dataset)
+        train_losses.append(epoch_train_loss)
+        inv_losses.append(epoch_inv_loss)
+        
+        # Validation Phase
+        model.eval()
+        val_loss = 0.0
+        all_preds, all_targets = [], []
+        
+        with torch.no_grad():
+            for images, labels, _, _ in val_loader:
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item() * images.size(0)
+                
+                preds = torch.argmax(outputs, dim=1)
+                all_preds.extend(preds.cpu().numpy())
+                all_targets.extend(labels.cpu().numpy())
+                
+        epoch_val_loss = val_loss / len(val_loader.dataset)
+        val_losses.append(epoch_val_loss)
+        val_f1 = f1_score(all_targets, all_preds, average='macro')
+        
+        print(f"\rEpoch {epoch+1:02d}/{epochs} | Train Loss: {epoch_train_loss:.4f} | Inv Loss: {epoch_inv_loss:.4f} | Val Loss: {epoch_val_loss:.4f} | Val Macro-F1: {val_f1:.4f}")
+        
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            torch.save(model.state_dict(), "output/best_model.pth")
+            print(f"  --> Saved best model checkpoint (Val Macro-F1: {best_val_f1:.4f})!")
 
-plt.figure(figsize=(8, 5))
-plt.plot(range(1, epochs + 1), train_losses, label="Train Loss")
-plt.plot(range(1, epochs + 1), val_losses, label="Val Loss")
-plt.xlabel("Epochs")
-plt.ylabel("Loss")
-plt.title("ResNet18 Training & Validation Loss")
-plt.legend()
-plt.savefig("output/loss_curve.png")
-print("\nLoss curve saved to output/loss_curve.png")
+    # Plot loss curves
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(range(1, epochs + 1), train_losses, label="Train Total Loss")
+    plt.plot(range(1, epochs + 1), val_losses, label="Val Loss")
+    plt.xlabel("Epochs")
+    plt.ylabel("Loss")
+    plt.title("Classification & Total Loss")
+    plt.legend()
+
+    plt.subplot(1, 2, 2)
+    plt.plot(range(1, epochs + 1), inv_losses, label="Invariance MSE Loss", color="purple")
+    plt.xlabel("Epochs")
+    plt.ylabel("MSE")
+    plt.title("Linguistic Invariance Convergence")
+    plt.legend()
+
+    plt.tight_layout()
+    plt.savefig("output/loss_curve.png")
+    print("\nLoss curves saved to output/loss_curve.png")
+
+if __name__ == "__main__":
+    train_model()
