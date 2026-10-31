@@ -13,8 +13,7 @@ class LanguageInvariantResNet18(nn.Module):
         super().__init__()
         base = resnet18(weights=ResNet18_Weights.DEFAULT)
         
-        # Freeze early layers to prevent overfitting to specific speaker timbres
-        # General low-level audio filters (edges, textures) stay intact
+        # Freeze early layers to retain low-level acoustic edge filters
         for param in [base.conv1, base.bn1, base.layer1, base.layer2, base.layer3]:
             for p in param.parameters():
                 p.requires_grad = False
@@ -27,7 +26,7 @@ class LanguageInvariantResNet18(nn.Module):
             base.layer1,
             base.layer2,
             base.layer3,
-            base.layer4,  # Only layer4 is fine-tuned
+            base.layer4,  # Layer 4 is fine-tuned
             base.avgpool
         )
         self.dropout = nn.Dropout(p=dropout_rate)
@@ -35,7 +34,7 @@ class LanguageInvariantResNet18(nn.Module):
         
     def forward_features(self, x):
         feats = self.backbone(x)
-        feats = torch.flatten(feats, 1) # 512-dimensional embedding
+        feats = torch.flatten(feats, 1) # 512-dimensional bottleneck embedding
         return feats
         
     def forward(self, x):
@@ -61,14 +60,14 @@ def train_model():
 
     model = LanguageInvariantResNet18(num_classes=2, dropout_rate=0.5).to(device)
 
-    # 1. Class weights & Loss
+    # 1. Class Weights & Loss Formulation
     class_weights = torch.tensor([1.0, 2.2]).to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     
-    epochs = 25
-    lambda_invariance = 0.5
+    epochs = 15
+    lambda_invariance = 1.5  # Heavy weight on explicit Cosine feature distance
 
-    # 2. Extract trainable parameter lists
+    # 2. Extract trainable parameter groups
     trainable_backbone = [p for p in model.backbone.parameters() if p.requires_grad]
     trainable_params = [p for p in model.parameters() if p.requires_grad]
 
@@ -79,7 +78,7 @@ def train_model():
     ])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    # 4. Initialize tracking variables (Prevents NameError)
+    # 4. Tracking Variables
     best_val_f1 = 0.0
     train_losses, val_losses, inv_losses = [], [], []
 
@@ -98,7 +97,7 @@ def train_model():
             images, labels = images.to(device), labels.to(device)
             
             spec_fwd = images
-            spec_bwd = torch.flip(images, dims=[-1])
+            spec_bwd = torch.flip(images, dims=[-1])  # Symmetrical time-reversal
             
             optimizer.zero_grad()
             
@@ -108,7 +107,10 @@ def train_model():
             out_fwd = model.fc(model.dropout(feat_fwd))
             
             loss_cls = criterion(out_fwd, labels)
-            loss_inv = F.mse_loss(feat_fwd, feat_bwd)
+            
+            # Direct Cosine Distance Loss (1.0 - Cosine Similarity)
+            cos_sim = F.cosine_similarity(feat_fwd, feat_bwd, dim=1)
+            loss_inv = (1.0 - cos_sim).mean()
             
             total_loss = loss_cls + lambda_invariance * loss_inv
             
@@ -164,9 +166,9 @@ def train_model():
     plt.legend()
 
     plt.subplot(1, 2, 2)
-    plt.plot(range(1, epochs + 1), inv_losses, label="Invariance MSE Loss", color="purple")
+    plt.plot(range(1, epochs + 1), inv_losses, label="Cosine Invariance Loss", color="purple")
     plt.xlabel("Epochs")
-    plt.ylabel("MSE")
+    plt.ylabel("1 - Cosine Similarity")
     plt.title("Linguistic Invariance Convergence")
     plt.legend()
 
